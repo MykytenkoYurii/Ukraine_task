@@ -1,0 +1,149 @@
+
+-- Обчислення географічного центру України (center_lon, center_lat).
+CREATE TABLE ukraine_center AS
+SELECT 
+    ST_X(ST_Centroid(ST_Union(ST_MakeValid(geometry)))) AS center_lon,
+    ST_Y(ST_Centroid(ST_Union(ST_MakeValid(geometry)))) AS center_lat
+FROM ukraine_border;
+
+-- Об'єднання всіх частин кордону в один полігон із виправленням простих помилок.
+CREATE TABLE ukraine_raw_union_safe AS
+SELECT ST_Union(ST_MakeValid(geometry)) AS geom
+FROM ukraine_border;
+
+-- Створення просторового індексу для сирого контуру.
+CREATE INDEX idx_raw_union_safe_geom ON ukraine_raw_union_safe USING GIST (geom);
+
+-- Подвійна буферизація для усунення складних топологічних дефектів.
+CREATE TABLE buffer_step AS
+SELECT 
+    ST_Buffer(
+        ST_Buffer(geom, 0.001, 'join=mitre endcap=flat'), 
+        -0.001, 
+        'join=mitre endcap=flat'
+    ) AS cleaned_geom
+FROM ukraine_raw_union_safe;
+
+-- Вибір найбільшого полігону, що є фінальним, чистим контуром України.
+CREATE TABLE ukraine_clean_border AS
+WITH FinalDump AS (
+    SELECT (ST_Dump(cleaned_geom)).geom AS geom
+    FROM buffer_step
+)
+SELECT geom 
+FROM FinalDump
+ORDER BY ST_Area(geom) DESC 
+LIMIT 1;
+
+-- Видалення тимчасової таблиці та індексування фінального чистого кордону.
+DROP TABLE buffer_step;
+CREATE INDEX idx_clean_border_geom ON ukraine_clean_border USING GIST (geom);
+
+-- Генерація квадратної сітки 2x2 км у метричній проекції (EPSG:3857).
+CREATE TABLE ukraine_grid AS
+SELECT
+    (ST_SquareGrid(2000, ST_SetSRID(ST_Extent(ST_Transform(geom, 3857)), 3857))).*
+FROM ukraine_clean_border;
+
+-- Обрізання сітки: Видалення всіх квадратів, що не перетинають територію України.
+DELETE FROM ukraine_grid
+WHERE NOT ST_Intersects(geom, (
+    SELECT ST_Transform(geom, 3857) 
+    FROM ukraine_clean_border
+));
+
+-- Створення просторового індексу для таблиці сітки.
+CREATE INDEX idx_ukraine_grid_geom ON ukraine_grid USING GIST (geom);
+
+-- Екстракція всіх вершин з комірок сітки.
+CREATE TABLE grid_vertices AS
+WITH DumpedPoints AS (
+    SELECT 
+        ug.i AS i_grid_id, 
+        ug.j AS j_grid_id,
+        (ug.i || '_' || ug.j) AS grid_cell_name, -- Створення унікального ID комірки (наприклад, '100_50')
+        (ST_DumpPoints(ug.geom)).geom AS vertex_point_3857
+    FROM ukraine_grid ug
+)
+SELECT
+    dp.grid_cell_name, 
+    dp.vertex_point_3857,
+    ST_Transform(dp.vertex_point_3857, 4326) AS vertex_point -- Перетворення в WGS84 (4326)
+FROM DumpedPoints dp;
+
+-- Додавання PRIMARY KEY для кожної вершини.
+ALTER TABLE grid_vertices
+ADD COLUMN id SERIAL PRIMARY KEY;
+
+-- Створення просторового індексу для точок вершин.
+CREATE INDEX idx_vertices_geom ON grid_vertices USING GIST (vertex_point);
+
+-- Створення функції, яка генерує сектор.
+CREATE OR REPLACE FUNCTION ST_Sector_Fixed(
+    center GEOMETRY, 
+    radius NUMERIC, 
+    azimuth_center NUMERIC, 
+    angle_width NUMERIC
+)
+RETURNS GEOMETRY AS $$
+DECLARE
+    angle_start NUMERIC := azimuth_center - angle_width / 2;
+    angle_end NUMERIC := azimuth_center + angle_width / 2;
+    num_points INTEGER := 16; 
+    points GEOMETRY[];
+    i INTEGER;
+BEGIN
+    points := ARRAY[center]; 
+
+    FOR i IN 0..num_points LOOP
+        points := array_append(points, 
+            ST_Project(
+                center::geography, 
+                radius, 
+                radians(angle_start + (angle_end - angle_start) * i / num_points)
+            )::geometry
+        );
+    END LOOP;
+
+    points := array_append(points, center);
+
+    RETURN ST_SetSRID(ST_MakePolygon(ST_MakeLine(points)), ST_SRID(center));
+END;
+$$ LANGUAGE plpgsql;
+
+-- Генерація всіх секторів: Створення трьох секторів (0°, 120°, 240°) з радіусом 5 км для кожної вершини.
+CREATE TABLE all_sectors AS
+WITH SectorData AS (
+    SELECT
+        id AS vertex_id,
+        vertex_point AS center_point_4326, 
+        azimuth
+    FROM grid_vertices,
+    unnest(ARRAY[0, 120, 240]) AS azimuth
+)
+SELECT
+    sd.vertex_id,
+    sd.azimuth,
+    ST_Sector_Fixed(
+        sd.center_point_4326, 
+        5000,              -- Радіус 5 км
+        sd.azimuth,        
+        60                 -- Розкриття 60 градусів
+    ) AS sector_geom
+FROM SectorData sd;
+
+-- Створення індексу для таблиці секторів.
+CREATE INDEX idx_all_sectors_geom ON all_sectors USING GIST (sector_geom);
+
+-- Створення фінальної таблиці та обчислення перетину для ВСІХ секторів.
+CREATE TABLE sector_intersections_full AS
+SELECT
+    s.vertex_id AS sector_source_vertex_id, -- ID вершини, з якої виходить сектор (Джерело)
+    s.azimuth,                               
+    v.id AS intersecting_vertex_id         -- ID вершини, яку перетинає сектор (Ціль)
+FROM all_sectors s 
+JOIN grid_vertices v 
+ON ST_Intersects(s.sector_geom, v.vertex_point);
+
+-- Створення індексу для результатів аналізу перетину (sector_intersections_half).
+CREATE INDEX idx_intersections_half_source_id ON sector_intersections_half USING BTREE (sector_source_vertex_id);
